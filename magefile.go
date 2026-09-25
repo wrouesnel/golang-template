@@ -14,6 +14,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"math/bits"
 	"net/http"
@@ -208,14 +211,47 @@ var platformsLookup map[string]Platform = func() map[string]Platform {
 	return ret
 }()
 
-// productName can be overridden by environ product name.
+// productName is the Name constant from version/version.go, so release archives are named
+// the same as the application. It can be overridden by environ product name.
 var productName = func() string {
 	if name := os.Getenv("PRODUCT_NAME"); name != "" {
+		return name
+	}
+	if name := versionName(); name != "" {
 		return name
 	}
 	name, _ := os.Getwd()
 	return path.Base(name)
 }()
+
+// versionName reads the Name constant from version/version.go, or returns "" if it
+// can't be found.
+func versionName() string {
+	file, err := parser.ParseFile(token.NewFileSet(), path.Join(curDir, "version", "version.go"), nil, 0)
+	if err != nil {
+		return ""
+	}
+	for _, decl := range file.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok || genDecl.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range genDecl.Specs {
+			valueSpec := spec.(*ast.ValueSpec)
+			for i, ident := range valueSpec.Names {
+				if ident.Name != "Name" || i >= len(valueSpec.Values) {
+					continue
+				}
+				if lit, ok := valueSpec.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					if name, err := strconv.Unquote(lit.Value); err == nil {
+						return name
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
 
 // Source files.
 var goSrc []string
@@ -232,15 +268,25 @@ var versionSymbol = func() string {
 	return parsedGoMod.Module.Mod.Path + "/version.Version"
 }
 
+// gitOutput runs git and returns its trimmed stdout, or "" on failure. Unlike sh.Output
+// it discards stderr, since a repository without tags is a normal state for git describe.
+func gitOutput(args ...string) string {
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 var version = func() string {
 	if v := os.Getenv("VERSION"); v != "" {
 		return v
 	}
-	out, _ := sh.Output("git", "describe", "--dirty")
+	out := gitOutput("describe", "--dirty")
 
 	if out == "" {
 		// Try and at least describe the git commit.
-		out, _ = sh.Output("git", "describe", "--dirty", "--always")
+		out = gitOutput("describe", "--dirty", "--always")
 		if out != "" {
 			//nolint:perfsprint
 			return fmt.Sprintf("v0.0.0-0-%s", out)
@@ -255,7 +301,7 @@ var versionShort = func() string {
 	if v := os.Getenv("VERSION_SHORT"); v != "" {
 		return v
 	}
-	out, _ := sh.Output("git", "describe", "--abbrev=0")
+	out := gitOutput("describe", "--abbrev=0")
 
 	if out == "" {
 		return "v0.0.0"
@@ -454,6 +500,10 @@ func init() {
 			panic(err)
 		}
 		for _, finfo := range finfos {
+			// Each binary is a directory - skip files such as README.md
+			if !finfo.IsDir() {
+				continue
+			}
 			results = append(results, finfo.Name())
 		}
 		return results
@@ -542,9 +592,7 @@ func Tools() (err error) {
 		return nil
 	}
 
-	// golangci-lint don't want to support if it's not a binary release, so
-	// don't go-install.
-	if berr := toolBuild("static", []string{"", "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2"},
+	if berr := toolBuild("static", []string{"golangci-lint", "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2"},
 		[]string{"gocovmerge", "github.com/wadey/gocovmerge@latest"},
 		[]string{"oapi-codegen", "github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest"},
 	); berr != nil {
@@ -562,7 +610,7 @@ func lintArgs(args ...string) []string {
 	return returnedArgs
 }
 
-// Lint runs gometalinter for code quality. CI will run this before accepting PRs.
+// Lint runs golangci-lint for code quality. CI will run this before accepting PRs.
 func Lint() error {
 	mg.Deps(Tools)
 	extraArgs := lintArgs("run")
@@ -746,7 +794,7 @@ func Coverage() error {
 //
 //nolint:unparam
 func All() error {
-	mg.SerialDeps(Style, Lint, Test, Coverage, Release)
+	mg.SerialDeps(Style, Lint, Test, Coverage, ReleaseAll)
 	return nil
 }
 
@@ -759,8 +807,21 @@ func GithubReleaseMatrix() error {
 		output = append(output, platform.String())
 	}
 	jsonData := must(json.Marshal(output))
-	fmt.Printf("::set-output name=release-matrix::%s\n", string(jsonData))
-	return nil
+	line := fmt.Sprintf("release-matrix=%s\n", string(jsonData))
+
+	// GitHub Actions reads step outputs from the file named by GITHUB_OUTPUT.
+	outputFile := os.Getenv("GITHUB_OUTPUT")
+	if outputFile == "" {
+		fmt.Print(line)
+		return nil
+	}
+	f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(line)
+	return err
 }
 
 // GoGenerate runs go generate.
@@ -768,7 +829,7 @@ func GoGenerate() error {
 	return sh.Run("go", "generate", "./...")
 }
 
-// webDir holds the React web interface embedded into the coordinator.
+// webDir holds any embedded web interface.
 var webDir = normalizePath(path.Join(curDir, "web"))
 
 // nodeDistURL is where Node.js releases are downloaded from.
@@ -989,11 +1050,16 @@ func npm(args ...string) error {
 	return sh.RunWith(env, path.Join(nodeBinDir, "npm"), args...)
 }
 
-// Web builds the coordinator web interface into web/dist for embedding. Set
-// SKIP_WEB=1 to skip it, e.g. when dist was built in an earlier stage.
+// Web builds the web interface into web/dist for embedding. It is skipped if
+// web/package.json does not exist, or if SKIP_WEB=1 is set, e.g. when dist was
+// built in an earlier stage.
 func Web() error {
 	if os.Getenv("SKIP_WEB") != "" {
 		Log("SKIP_WEB set: not building the web interface")
+		return nil
+	}
+	if _, err := os.Stat(path.Join(webDir, "package.json")); errors.Is(err, os.ErrNotExist) {
+		Log("No web/package.json: not building the web interface")
 		return nil
 	}
 
@@ -1194,8 +1260,9 @@ func ReleaseAll() error {
 
 // Clean deletes build output and cleans up the working directory.
 func Clean() error {
+	// Remove the root symlinks made by Binary
 	for _, name := range goCmds {
-		if err := sh.Rm(path.Join(binDir, name)); err != nil {
+		if err := sh.Rm(path.Join(curDir, name)); err != nil {
 			return err
 		}
 	}
@@ -1229,6 +1296,10 @@ func Debug() error {
 
 // Autogen configure local git repository with commit hooks.
 func Autogen() error {
+	if _, err := os.Stat(gitHookDir); errors.Is(err, os.ErrNotExist) {
+		fmt.Println("No", constGitHookDir, "directory: no git hooks to install")
+		return nil
+	}
 	fmt.Println("Installing git hooks in local repository...")
 
 	for _, fname := range must(os.ReadDir(gitHookDir)) {
