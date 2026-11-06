@@ -3,7 +3,7 @@ module github.com/wrouesnel/golang-template
 go 1.27.1
 
 require (
-	github.com/alecthomas/kong v1.16.1
+	github.com/alecthomas/kong v1.17.0
 	github.com/chigopher/pathlib v0.19.1
 	github.com/integralist/go-findroot v0.0.0-20160518114804-ac90681525dc
 	github.com/magefile/mage v1.17.2
