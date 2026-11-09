@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -42,6 +43,7 @@ import (
 
 	"github.com/samber/lo"
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/semver"
 )
 
 var (
@@ -268,46 +270,102 @@ var versionSymbol = func() string {
 	return parsedGoMod.Module.Mod.Path + "/version.Version"
 }
 
-// gitOutput runs git and returns its trimmed stdout, or "" on failure. Unlike sh.Output
-// it discards stderr, since a repository without tags is a normal state for git describe.
-func gitOutput(args ...string) string {
+// git runs git, discarding its stderr, as a repository without tags is a
+// normal state for git describe.
+func git(args ...string) (string, error) {
 	out, err := exec.Command("git", args...).Output()
-	if err != nil {
-		return ""
+	return strings.TrimSpace(string(out)), err
+}
+
+var (
+	describeRx = regexp.MustCompile(`^(.*?)v(\d+)\.(\d+)\.(\d+)-(\d+)-g([0-9a-f]+)(-dirty)?$`)
+	branchRx   = regexp.MustCompile(`[^0-9A-Za-z-]+`)
+)
+
+// describe is the version of the repository's HEAD, which sorts in the
+// order builds were made (Semantic Versioning 2.0):
+//
+//   - a commit tagged vX.Y.Z (a release) is vX.Y.Z;
+//   - N commits after it, on the default branch or a detached HEAD (as
+//     CI's), is the next patch's pre-release: vX.Y.(Z+1)-dev.N.gHASH;
+//   - before any tag, v0.0.1-dev.N.gHASH, N the commits in all;
+//   - on another branch, -branch-NAME.N in place of -dev.N, sorting below;
+//   - uncommitted changes end it with -dirty.
+//
+// VERSION_TAG_MATCH (git describe --match, as app-v*) limits the tags, in a
+// repository whose other tags are another program's. N needs the whole
+// history (CI's checkout fetch-depth: 0), and only grows on a branch which
+// is never rewritten.
+func describe() (string, error) {
+	match := os.Getenv("VERSION_TAG_MATCH")
+	if match == "" {
+		match = "v[0-9]*"
 	}
-	return strings.TrimSpace(string(out))
+	hash, err := git("rev-parse", "--short=7", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	dirty := ""
+	if out, err := git("status", "--porcelain", "--untracked-files=no"); err == nil && out != "" {
+		dirty = "-dirty"
+	}
+	atoi := func(s string) int { n, _ := strconv.Atoi(strings.TrimSpace(s)); return n }
+	major, minor, patch, count := 0, 0, 0, 0
+	if desc, err := git("describe", "--tags", "--long", "--abbrev=7", "--match", match); err == nil {
+		m := describeRx.FindStringSubmatch(desc)
+		if m == nil {
+			return "", fmt.Errorf("git describe gave %q, not a vX.Y.Z tag's description", desc)
+		}
+		major, minor, patch, count = atoi(m[2]), atoi(m[3]), atoi(m[4]), atoi(m[5])
+		if count == 0 && dirty == "" {
+			return fmt.Sprintf("v%d.%d.%d", major, minor, patch), nil
+		}
+	} else {
+		out, err := git("rev-list", "--count", "HEAD")
+		if err != nil {
+			return "", err
+		}
+		count = atoi(out)
+	}
+	line := "dev"
+	if cur, err := git("rev-parse", "--abbrev-ref", "HEAD"); err == nil && cur != "HEAD" {
+		def := "main"
+		if out, err := git("symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil && out != "" {
+			def = strings.TrimPrefix(out, "origin/")
+		} else if _, err := git("rev-parse", "--verify", "--quiet", "refs/heads/main"); err != nil {
+			def = "master"
+		}
+		if cur != def {
+			line = "branch-" + strings.Trim(branchRx.ReplaceAllString(cur, "-"), "-")
+		}
+	}
+	v := fmt.Sprintf("v%d.%d.%d-%s.%d.g%s%s", major, minor, patch+1, line, count, hash, dirty)
+	if !semver.IsValid(v) {
+		return "", fmt.Errorf("%s is not a valid semantic version", v)
+	}
+	return v, nil
 }
 
 var version = func() string {
 	if v := os.Getenv("VERSION"); v != "" {
 		return v
 	}
-	out := gitOutput("describe", "--dirty")
-
-	if out == "" {
-		// Try and at least describe the git commit.
-		out = gitOutput("describe", "--dirty", "--always")
-		if out != "" {
-			//nolint:perfsprint
-			return fmt.Sprintf("v0.0.0-0-%s", out)
-		}
+	v, err := describe()
+	if err != nil {
 		return "v0.0.0"
 	}
-
-	return out
+	return v
 }()
 
+// versionShort is the version's release, without its pre-release: vX.Y.Z.
 var versionShort = func() string {
 	if v := os.Getenv("VERSION_SHORT"); v != "" {
 		return v
 	}
-	out := gitOutput("describe", "--abbrev=0")
-
-	if out == "" {
-		return "v0.0.0"
+	if c := semver.Canonical(version); c != "" {
+		return strings.SplitN(strings.SplitN(c, "-", 2)[0], "+", 2)[0]
 	}
-
-	return out
+	return "v0.0.0"
 }()
 
 var concurrency = func() int {

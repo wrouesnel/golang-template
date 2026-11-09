@@ -35,6 +35,24 @@ go run mage.go binary
 `go run mage.go releaseAll` cross-compiles release archives for every platform into
 `release/`.
 
+### Versions
+
+The build stamps every binary with a version which sorts in the order builds were made
+(Semantic Versioning 2.0, from git):
+
+| The commit | Its version |
+|---|---|
+| tagged `vX.Y.Z` (a release) | `vX.Y.Z` |
+| N commits after it, on the default branch or a detached HEAD | `vX.Y.(Z+1)-dev.N.gHASH` |
+| before any tag | `v0.0.1-dev.N.gHASH`, N its commits in all |
+| on another branch | `vX.Y.(Z+1)-branch-NAME.N.gHASH`, below the default branch's |
+| with uncommitted changes | the above, ending `-dirty` |
+
+Release by tagging `vX.Y.Z` on the default branch, which is never rewritten, so N only grows.
+In a repository whose other tags are another program's, tag `PREFIXvX.Y.Z` and set
+`VERSION_TAG_MATCH=PREFIXv*`. `VERSION` and `VERSION_SHORT` override it. CI needs the whole
+history (`fetch-depth: 0`) for N.
+
 ## Configuration
 
 The binary loads `golang-template.yml` from the working directory, or the file named by
