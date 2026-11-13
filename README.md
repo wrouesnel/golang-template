@@ -53,6 +53,12 @@ In a repository whose other tags are another program's, tag `PREFIXvX.Y.Z` and s
 `VERSION_TAG_MATCH=PREFIXv*`. `VERSION` and `VERSION_SHORT` override it. CI needs the whole
 history (`fetch-depth: 0`) for N.
 
+### Link flags
+
+`EXTRA_LDFLAGS` adds to the binaries' link flags, as `-X` symbols a build sets beside the version
+(`EXTRA_LDFLAGS="-X example.com/app/pkg/x.Value=..." go run mage.go binary`). They're recorded
+beside the binaries (`bin/*/.extra-ldflags`), so changing them alone builds the binaries again.
+
 ## Configuration
 
 The binary loads `golang-template.yml` from the working directory, or the file named by

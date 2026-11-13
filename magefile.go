@@ -1147,8 +1147,15 @@ func makeBuilder(cmd string, platform Platform) func() error {
 			return errors.Wrapf(err, "error making directory: cmd: %s", cmd)
 		}
 
+		// EXTRA_LDFLAGS are more link flags (as -X symbols the build sets,
+		// beside the version). They're recorded beside the binaries, so a
+		// change of them alone builds them again.
+		stamp, err := extraLDFlagsStamp(platform.PlatformDir())
+		if err != nil {
+			return errors.Wrapf(err, "error recording EXTRA_LDFLAGS: cmd: %s", cmd)
+		}
 		Log("Checking for changes:", platform.PlatformBin(cmd))
-		if changed, err := target.Path(platform.PlatformBin(cmd), goSrc...); !changed {
+		if changed, err := target.Path(platform.PlatformBin(cmd), append([]string{stamp}, goSrc...)...); !changed {
 			if err != nil {
 				if !os.IsNotExist(err) {
 					return errors.Wrapf(err, "error while checking for changes: cmd: %s", cmd)
@@ -1160,10 +1167,30 @@ func makeBuilder(cmd string, platform Platform) func() error {
 
 		fmt.Println("Building", platform.PlatformBin(cmd))
 		return sh.RunWith(map[string]string{"CGO_ENABLED": "0", "GOOS": platform.OS, "GOARCH": platform.Arch},
-			"go", "build", "-a", "-ldflags", fmt.Sprintf("-buildid='' -extldflags '-static' -X %s=%s", versionSymbol(), version),
+			"go", "build", "-a", "-ldflags", ldflags(),
 			"-trimpath", "-o", platform.PlatformBin(cmd), cmdSrc)
 	}
 	return f
+}
+
+// ldflags are the binaries' link flags: the version, and EXTRA_LDFLAGS.
+func ldflags() string {
+	flags := fmt.Sprintf("-buildid='' -extldflags '-static' -X %s=%s", versionSymbol(), version)
+	if extra := os.Getenv("EXTRA_LDFLAGS"); extra != "" {
+		flags += " " + extra
+	}
+	return flags
+}
+
+// extraLDFlagsStamp records EXTRA_LDFLAGS in dir, rewriting the file only
+// when they change, and returns its path: an input of the binaries.
+func extraLDFlagsStamp(dir string) (string, error) {
+	path := filepath.Join(dir, ".extra-ldflags")
+	want := os.Getenv("EXTRA_LDFLAGS")
+	if have, err := os.ReadFile(path); err == nil && string(have) == want {
+		return path, nil
+	}
+	return path, os.WriteFile(path, []byte(want), 0o644)
 }
 
 func getCurrentPlatform() *Platform {
