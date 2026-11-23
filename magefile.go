@@ -259,6 +259,11 @@ func versionName() string {
 var goSrc []string
 var goDirs []string
 
+// binSrc are the binaries' inputs: goSrc, go.mod and go.sum, and the source
+// of each module go.mod replaces by a local directory, so a change there
+// (a submodule moved) builds them again.
+var binSrc []string
+
 // Due to go:generate and asset embedding interaction, this is now an on demand function
 var goPkgs func() []string
 var goCmds []string
@@ -505,7 +510,8 @@ func init() {
 				return nil
 			}
 
-			if !strings.HasSuffix(path, ".go") {
+			// What a package embeds is in the binaries too (packageFiles).
+			if strings.HasSuffix(path, ".md") {
 				return nil
 			}
 
@@ -520,11 +526,16 @@ func init() {
 		if err != nil {
 			panic(err)
 		}
-		return *results
+		return packageFiles(*results)
 	}()
+	binSrc = append(append([]string{}, goSrc...), localModuleSrc()...)
 	goDirs = func() []string {
 		resultMap := make(map[string]struct{})
 		for _, path := range goSrc {
+			// A package's embedded files are in goSrc too: its Go files say it.
+			if !strings.HasSuffix(path, ".go") {
+				continue
+			}
 			absDir, err := filepath.Abs(filepath.Dir(path))
 			if err != nil {
 				panic(err)
@@ -1138,6 +1149,76 @@ func Web() error {
 	return nil
 }
 
+// packageFiles are the Go files and templates of files, and the other files
+// of their packages' directories, which they may embed (go:embed: as
+// example.yml, comments.json).
+func packageFiles(files []string) []string {
+	pkgDirs := map[string]bool{}
+	for _, f := range files {
+		if strings.HasSuffix(f, ".go") {
+			pkgDirs[filepath.Dir(f)] = true
+		}
+	}
+	return lo.Filter(files, func(f string, _ int) bool {
+		return strings.HasSuffix(f, ".go") || strings.HasSuffix(f, ".tmpl") || pkgDirs[filepath.Dir(f)]
+	})
+}
+
+// localModuleSrc are go.mod and go.sum, and the source files (packageFiles)
+// of the modules go.mod replaces by local directories.
+func localModuleSrc() []string {
+	var files []string
+	for _, name := range []string{"go.mod", "go.sum"} {
+		if p, err := filepath.Abs(name); err == nil && fileExists(p) {
+			files = append(files, p)
+		}
+	}
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		return files
+	}
+	mod, err := modfile.Parse("go.mod", data, nil)
+	if err != nil {
+		panic(err)
+	}
+	for _, r := range mod.Replace {
+		if r.New.Version != "" {
+			continue
+		}
+		root, err := filepath.Abs(r.New.Path)
+		if err != nil {
+			panic(err)
+		}
+		var found []string
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, _ error) error {
+			if info == nil {
+				return nil
+			}
+			name := info.Name()
+			if info.IsDir() {
+				switch {
+				case path == root:
+					return nil
+				case name == ".git" || name == "buildroot" || name == "bin" || name == "dl" || name == "release" ||
+					name == "vendor" || name == "node_modules" || name == "testdata" || strings.HasPrefix(name, "output-") ||
+					strings.HasPrefix(name, "."):
+					return filepath.SkipDir
+				case fileExists(filepath.Join(path, "go.mod")):
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if info.Mode().IsRegular() && !strings.HasSuffix(name, ".md") && !strings.HasSuffix(name, "_test.go") {
+				found = append(found, path)
+			}
+			return nil
+		})
+		files = append(files, packageFiles(found)...)
+		files = append(files, filepath.Join(root, "go.mod"))
+	}
+	return files
+}
+
 func makeBuilder(cmd string, platform Platform) func() error {
 	f := func() error {
 		cmdSrc := fmt.Sprintf("./%s/%s", must(filepath.Rel(curDir, cmdDir)), cmd)
@@ -1155,7 +1236,7 @@ func makeBuilder(cmd string, platform Platform) func() error {
 			return errors.Wrapf(err, "error recording EXTRA_LDFLAGS: cmd: %s", cmd)
 		}
 		Log("Checking for changes:", platform.PlatformBin(cmd))
-		if changed, err := target.Path(platform.PlatformBin(cmd), append([]string{stamp}, goSrc...)...); !changed {
+		if changed, err := target.Path(platform.PlatformBin(cmd), append([]string{stamp}, binSrc...)...); !changed {
 			if err != nil {
 				if !os.IsNotExist(err) {
 					return errors.Wrapf(err, "error while checking for changes: cmd: %s", cmd)
@@ -1466,4 +1547,9 @@ func Autogen() error {
 	}
 
 	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
