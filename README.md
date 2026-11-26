@@ -19,7 +19,8 @@ below the title.
 | `pkg/` | Other exportable packages of the application. |
 | `version/` | Application name, description and version. `Version` is set at link time by the build. |
 | `golang-template.yml` | Default configuration file, loaded from the working directory. |
-| `magefile.go`, `mage.go` | The build system. Run `go run mage.go -l` to list targets. |
+| `magefile.go`, `mage.go` | The build system: `magefile.go` imports its targets from `magebuild` and configures them. Run `go run mage.go -l` to list targets. |
+| `magebuild/` | The build's targets, as a package other projects import: see [Using the build in another project](#using-the-build-in-another-project). |
 | `web/` | Optional web interface. It's built and embedded if `web/package.json` exists. |
 | `Dockerfile` | Container image, built and pushed by `.github/workflows/container.yml`. |
 | `.github/workflows/` | CI: build and test on every push, releases on `v*` tags. |
@@ -34,6 +35,36 @@ go run mage.go binary
 `go run mage.go binary` builds into `bin/` and symlinks each binary into the repository root.
 `go run mage.go releaseAll` cross-compiles release archives for every platform into
 `release/`.
+
+### Using the build in another project
+
+A project's `magefile.go` imports the targets rather than copying them, so they stay current
+with the template (`go get github.com/wrouesnel/golang-template@latest`):
+
+```go
+//go:build mage
+
+package main
+
+import (
+	//mage:import
+	"github.com/wrouesnel/golang-template/magebuild"
+)
+
+func init() {
+	magebuild.Configure(magebuild.Config{
+		// Commands built for some operating systems alone (cmd/'s names).
+		CmdOSes: map[string][]string{"my-tool": {"linux"}},
+	})
+}
+```
+
+with `mage.go` as the template's. `magebuild.Config` has the rest: the platforms built for
+(`Platforms`, else `DefaultPlatforms`), more directories which are no source (`SkipDirs`, as a
+build's trees; directories with a `go.mod` of their own are always passed over), compiling
+every command for each platform before `test` (`CrossBuild`), and more names for
+`VERSION_TAG_MATCH` (`VersionTagMatchEnv`). A target of the project's own is a function in
+its `magefile.go`, beside the imported ones.
 
 ### Versions
 
